@@ -1,6 +1,10 @@
 <?php
 namespace GWSN\FlysystemSharepoint;
 
+use Exception;
+use RuntimeException;
+use GuzzleHttp\Client;
+use GuzzleHttp\Exception\GuzzleException;
 use League\Flysystem\Config;
 use League\Flysystem\DirectoryAttributes;
 use League\Flysystem\FileAttributes;
@@ -8,6 +12,7 @@ use League\Flysystem\FilesystemAdapter;
 use League\Flysystem\StorageAttributes;
 use League\Flysystem\UnableToReadFile;
 use League\Flysystem\UnableToRetrieveMetadata;
+use Microsoft\Graph\Exception\GraphException;
 use Throwable;
 
 class FlysystemSharepointAdapter implements FilesystemAdapter
@@ -90,21 +95,122 @@ class FlysystemSharepointAdapter implements FilesystemAdapter
      */
     public function write(string $path, string $contents, Config $config): void
     {
-        $mimeType = $config->get('mimeType', 'text/plain');
-
-        $this->connector->getFile()->writeFile($this->applyPrefix($path), $contents, $mimeType);
+        //Files larger than 4MiB require an UploadSession
+        if (strlen($contents) > (4 * 1024 * 1024)) {
+            $stream = fopen('php://temp', 'r+');
+            fwrite($stream, $contents);
+            rewind($stream);
+            $this->writeStream($path, $stream, $config);
+        } else {
+            $mimeType = $config->get('mimeType', 'text/plain');
+            $this->connector->getFile()->writeFile($this->applyPrefix($path), $contents, $mimeType);
+        }
     }
 
     /**
+     * Snippet heavily inspired by: https://github.com/shitware-ltd/flysystem-msgraph
+     *
      * @param string $path
      * @param $contents
      * @param Config $config
      * @return void
-     * @throws \Exception
+     * @throws Exception
+     * @throws GuzzleException
      */
     public function writeStream(string $path, $contents, Config $config): void
     {
-        // TODO: Implement writeStream() method.
+        $uploadUrl = $this->createUploadSession($path);
+
+        $meta = fstat($contents) ?: throw new UnableToReadFile('Failed to get information about the file using the open file pointer');
+        $chunkSize = $config->withDefaults(['chunk_size' => 320 * 1024 * 10])->get('chunk_size');
+        $offset = 0;
+
+        //Chunks have to be uploaded without authorization headers, so we need a fresh guzzle client
+        $guzzle = new Client();
+        while ($chunk = fread($contents, $chunkSize)) {
+            $this->writeChunk($guzzle, $uploadUrl, $meta['size'], $chunk, $offset);
+            $offset += $chunkSize;
+        }
+    }
+
+    /**
+     * Snippet heavily inspired by: https://github.com/shitware-ltd/flysystem-msgraph
+     *
+     * @throws GuzzleException
+     * @throws GraphException
+     * @throws RuntimeException
+     */
+    private function writeChunk(Client $guzzle, string $upload_url, int $file_size, string $chunk, int $first_byte, int $retries = 0): void
+    {
+        $last_byte_pos = $first_byte + strlen($chunk) - 1;
+        $headers = [
+            'Content-Range' => "bytes $first_byte-$last_byte_pos/$file_size",
+            'Content-Length' => strlen($chunk),
+        ];
+        $response = $guzzle->request('PUT', $upload_url, [
+            'headers' => $headers,
+            'body' => $chunk,
+            'timeout' => 120,
+        ]);
+        if ($response->getStatusCode() === 404) {
+            throw new RuntimeException('Upload URL has expired, please create new upload session');
+        }
+        if ($response->getStatusCode() === 429) {
+            sleep($response->getHeader('Retry-After')[0] ?? 1);
+            $this->writeChunk($guzzle, $upload_url, $file_size, $chunk, $first_byte, $retries + 1);
+        }
+        if ($response->getStatusCode() >= 500) {
+            if ($retries > 3) {
+                throw new RuntimeException('Upload failed after 10 attempts.');
+            }
+            sleep(pow(2, $retries));
+            $this->writeChunk($guzzle, $upload_url, $file_size, $chunk, $first_byte, $retries + 1);
+        }
+        if (($file_size - 1) == $last_byte_pos) {
+            if ($response->getStatusCode() === 409) {
+                throw new RuntimeException('File name conflict. A file with the same name already exists at target destination.');
+            }
+            if ($response->getStatusCode() >= 200 && $response->getStatusCode() < 500) {
+                return;
+            }
+            $errorMsg = 'Microsoft Graph Request: Failed request, expected the returnCode 200 but actual %s';
+            throw new RuntimeException(sprintf($errorMsg, $response->getStatusCode()), $response->getStatusCode());
+        }
+        if ($response->getStatusCode() !== 202) {
+            throw new RuntimeException('Unknown error occurred while trying to upload file chunk. HTTP status code is ' . $response->getStatusCode());
+        }
+    }
+
+    /**
+     * Snippet heavily inspired by: https://github.com/shitware-ltd/flysystem-msgraph
+     *
+     * @throws Exception
+     */
+    public function createUploadSession(string $path): ?string
+    {
+        $requestUrl = $this->getFileUrl($path) . ':/createUploadSession';
+        $response = $this->connector->getFile()->getApiConnector()->request('POST', $requestUrl);
+        return $response['uploadUrl'] ?? null;
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function getFileUrl(string $path): string
+    {
+        $parent = explode('/', $path);
+        $fileName = array_pop($parent);
+
+        // Create parent folders if not exists
+        $parentFolder = sprintf('/%s', ltrim(implode('/', $parent), '/'));
+        if ($parentFolder !== '/') {
+            $this->connector->getFolder()->createFolderRecursive($parentFolder);
+        }
+
+        $parentFolderMeta = $this->connector->getFolder()->requestFolderMetadata($parentFolder);
+        $parentFolderId = $parentFolderMeta['id'];
+
+        return $this->getFileBaseUrl(null, $parentFolderId, sprintf(':/%s', $fileName));
     }
 
     /**
